@@ -1,0 +1,6 @@
+#!/bin/sh
+
+# fix permissions to tpm-luks.conf
+chmod 0600 /etc/tpm-luks.conf
+
+exit 0

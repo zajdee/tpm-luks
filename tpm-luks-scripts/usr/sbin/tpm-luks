@@ -1,0 +1,528 @@
+#!/bin/bash
+#
+# package reqs: tpm-tools, trousers
+#
+# Author: Kent Yoder <shpedoikal@gmail.com>
+#
+#set -x
+
+AWK=/usr/bin/awk
+CRYPTSETUP=/sbin/cryptsetup
+
+DEVICE=
+TMPFS_MNT=/dev/shm
+TMPFS_KEYFILE=
+SCRIPT_RC=0
+OWNERPASS=
+NVPASS=
+KEY_SLOT=
+RAND_SOURCE="/dev/urandom"
+RW_PERMS="AUTHREAD|AUTHWRITE"
+
+[ -f /etc/tpm-luks.conf ] && source /etc/tpm-luks.conf
+
+
+#
+# Do we need a password at tpm_nvdefine time (other than owner)? 1=false, 0=true
+#
+DEFINE_PASS=1
+#
+# Do we need a password at tpm_nvwrite time? 1=false, 0=true
+#
+WRITE_PASS=1
+#
+# Do we have an owner authorized write? 1=false, 0=true
+#
+OWNER_WRITE=1
+
+function prompt_for_new_nvpass
+{
+	if [ ${DEFINE_PASS} -eq 1 -a ${WRITE_PASS} -eq 1 ]; then
+		return
+	fi
+
+	if [ ! -n "${NVPASS}" ]; then
+		read -s -p "Enter a new TPM NV area password: " NVPASS1
+		echo
+		read -s -p "Re-enter the new TPM NV area password: " NVPASS2
+		echo
+
+		if [ "${NVPASS1}" != "${NVPASS2}" ]; then
+			echo "New passwords don't match!"
+			exit 1
+		fi
+
+		NVPASS=${NVPASS1}
+	fi
+}
+
+function get_nv_password
+{
+	if [ ! -n "${NVPASS}" ]; then
+		read -s -p "$1" NVPASS || exit 2
+		echo
+	fi
+}
+
+function get_owner_password
+{
+	# XXX this is the same as -z? TEST
+	if [ ! -n "${OWNERPASS}" ]; then
+		read -s -p "Enter your TPM owner password: " OWNERPASS || exit 3
+		echo
+	fi
+}
+
+function wipe_file
+{
+	dd if=/dev/zero of=${1} bs=1c count=${2} >/dev/null 2>&1
+	rm -f ${1}
+}
+
+function tpm_enabled
+{
+	if [ ! -e /sys/class/tpm/tpm0/device/enabled ]; then
+		echo "Your TPM device driver doesn't appear to be loaded. Please run"
+		echo "\`modprobe tpm_tis\` to load the driver and re-run this script"
+		exit 7
+	fi
+
+	if [ ! /sys/class/tpm/tpm0/device/enabled ]; then
+		echo "Your TPM is not enabled in your BIOS. Please halt the machine and"
+		echo "then cold boot into your BIOS to enable the TPM chip."
+		exit 8
+	fi
+
+	return 0
+}
+
+function tpm_owned
+{
+	if [ $(cat /sys/class/tpm/tpm0/device/owned) -ne 1 ]; then
+		echo "Your TPM is unowned, please take ownership (use owner password '$OWNERPASS' and no SRK password):"
+		tpm_takeownership || exit 9
+	fi
+
+	return 0
+}
+
+#
+# find_luks_nv_indexes - list defined NVRAM indexes that match the size we're
+#                        looking for
+#
+function find_luks_nv_indexes
+{
+	NV_INDEXES=( $(tpm_nvinfo | ${AWK} '$1$2 ~ /NVRAMindex/ { print $4 }') )
+	NUM_INDEXES=$(( ${#NV_INDEXES[@]} - 1 ))
+
+	for i in $(seq 0 ${NUM_INDEXES}); do
+		#echo "DBG: ${NV_INDEXES[$i]}"
+
+		#
+		# By limiting ourselves to indexes < TPM_LUKS_NV_INDEX_LIMIT_MAX, we
+		# avoid the manufacturer-set indexes
+		#
+		if [ $(( ${NV_INDEXES[$i]} )) -ge ${TPM_LUKS_NV_INDEX_LIMIT_MIN} ]; then
+		    if [ $(( ${NV_INDEXES[$i]} )) -le ${TPM_LUKS_NV_INDEX_LIMIT_MAX} ]; then
+			echo -n "${NV_INDEXES[$i]} "
+		    fi
+		fi
+	done
+}
+function in_array {
+	local e
+	# HEX is converted to DEC in D=$(( ${e} )) and compared against DEC in $1
+	for e in "${@:2}"; do D=$(( ${e} )); [ $D -eq $1 ] && return 1; done
+	return 0
+}
+function find_free_nv_index
+{
+	# start at index 1, making the default first index to use 2. In
+	# testing, the Atmel TPM threw errors if NV index 1 was used
+	NV_INDEX=$TPM_LUKS_NV_INDEX_LIMIT_MIN
+	NV_USED_INDEXES=$(tpm_nvinfo | ${AWK} '$1$2 ~ /NVRAMindex/ { print $4 }')
+
+	# iterate through NV indexes 2..$TPM_LUX_NV_INDEX_LIMIT
+	# compare current index with $NV_USED_INDEXES
+	# if the index is not yet used, return it
+	# take care of NV_USED_INDEXES - tpm_nvinfo returns data in HEX
+	while [ $NV_INDEX -le $TPM_LUKS_NV_INDEX_LIMIT_MAX ]; do
+		in_array $NV_INDEX $NV_USED_INDEXES
+		[ $? -eq 0 ] && echo $NV_INDEX && break
+		NV_INDEX=$(( NV_INDEX + 1))
+	done
+	# if no free index is available, we return empty string
+}
+
+function find_luks_device
+{
+	NUM_DEVS=$(blkid -t TYPE=crypto_LUKS|${AWK} -F: '{print $1}'|wc -l)
+
+	if [ $NUM_DEVS -eq 0 ]; then
+		echo "Couldn't find a LUKS device!"
+		exit 10
+	elif [ $NUM_DEVS -gt 1 ]; then
+		echo "Found more than one LUKS device, specify a device with the -d option"
+		exit 11
+	fi
+
+	DEVICE="$(blkid -t TYPE=crypto_LUKS|${AWK} -F: '{print $1}')"
+	if [ $? -ne 0 ]; then
+		echo "Couldn't find a LUKS device!"
+		exit 12
+	fi
+
+	return 0
+}
+
+#
+# device_get - Set DEVICE, or die trying
+#
+function device_get
+{
+	if [ ! -n "${DEVICE}" ]; then
+		find_luks_device
+	fi
+}
+
+#
+# keyfile_generate - put bytes from $RAND_SOURCE into $TMPFS_KEYFILE.
+#
+function keyfile_generate
+{
+	TMPFS_KEYFILE=${TMPFS_MNT}/key
+
+	dd if=${RAND_SOURCE} of=${TMPFS_KEYFILE} bs=1c count=${KEYFILE_SIZE} \
+		>/dev/null 2>&1 || exit 14
+}
+
+function nv_define_and_write
+{
+	PERMSFILE=${1}
+	DATAFILE=${TMPFS_KEYFILE}
+	NVPASS_OPTION=
+	OWNERPASS_OPTION="-y"
+	WRITEPASS_OPTION=
+
+	get_owner_password
+
+	if [ ! -n "${NVINDEX}" ]; then
+		NVINDEX=$(find_free_nv_index)
+		# if we did not find any free index, terminate
+		if [ ! -n "${NVINDEX}" ]; then
+		    return 15
+		fi
+	fi
+
+	if [ ! -z "${NVPASS}" ]; then
+		NVPASS_OPTION="-a ${NVPASS}"
+	fi
+
+	if [ "${OWNERPASS}" != "-y" ]; then
+		OWNERPASS_OPTION="-o ${OWNERPASS}"
+	fi
+
+	if [ -n "${PERMSFILE}" ]; then
+		tpm_nvdefine -i ${NVINDEX} -s ${KEYFILE_SIZE} -p ${RW_PERMS} \
+			${OWNERPASS_OPTION} ${NVPASS_OPTION} -f ${PERMSFILE} >/dev/null
+	else
+		tpm_nvdefine -i ${NVINDEX} -s ${KEYFILE_SIZE} -p ${RW_PERMS} \
+			${OWNERPASS_OPTION} ${NVPASS_OPTION} >/dev/null
+	fi
+
+	if [ $? -ne 0 ]; then
+		return 15
+	fi
+
+	# if there's a password required for writing the NV area, determine if its the
+	# owner password, or the NV area password
+	if [ ${OWNER_WRITE} -eq 0 ]; then
+		if [ "${OWNERPASS}" == "-y" ]; then
+			WRITEPASS_OPTION="-z"
+		else
+			WRITEPASS_OPTION="--password=${OWNERPASS}"
+		fi
+	elif [ ${WRITE_PASS} -eq 0 ]; then
+		WRITEPASS_OPTION="--password=${NVPASS}"
+	fi
+
+	tpm_nvwrite -i ${NVINDEX} -s ${KEYFILE_SIZE} -f ${DATAFILE} ${WRITEPASS_OPTION}
+	if [ $? -ne 0 ]; then
+		tpm_nvrelease -i ${NVINDEX} ${OWNERPASS_OPTION}
+		return 16
+	fi
+
+	return 0
+}
+
+#
+# luks_add_key
+#
+function luks_add_key
+{
+	KEYFILE=${1}
+
+	if [ ! -n "${KEY_SLOT}" ]; then
+		SLOTID=0
+		for S in $(cryptsetup luksDump ${DEVICE} | ${AWK} '$1$2 ~ /KeySlot/ {print $4}'); do
+			if [ "${S}" == "DISABLED" ]; then
+				KEY_SLOT=${SLOTID}
+				break
+			fi
+			SLOTID=$(( ${SLOTID} + 1 ))
+		done
+	fi
+
+	echo "You will now be prompted to enter any valid LUKS passphrase in order to store"
+	echo -e "the new TPM NVRAM secret in LUKS key slot ${KEY_SLOT}:\n"
+
+	$CRYPTSETUP luksAddKey --key-slot ${KEY_SLOT} $DEVICE ${KEYFILE}
+	SCRIPT_RC=$?
+}
+
+#
+# nv_get - read out a TPM NVRAM area onto a tmpfs mount.
+#
+# Sets TMPFS_KEYFILE and KEYFILE_SIZE on success
+#
+# exits the script on failure
+#
+function nv_get
+{
+	ERR_MSG="Couldn't read any indexes from TPM NVRAM"
+
+	if [ ! -n "$NVINDEX" ]; then
+		NV_INDEXES=( $(find_luks_nv_indexes) )
+	else
+		NV_INDEXES=( $NVINDEX )
+		ERR_MSG="Couldn't read index $NVINDEX from TPM NVRAM"
+	fi
+
+	if [ ${#NV_INDEXES} -eq 0 ]; then
+		echo "Found 0 NVRAM indexes readable by this script"
+		exit 17
+	fi
+
+	TMPFS_KEYFILE="${TMPFS_MNT}/data.tmp"
+	for i in ${NV_INDEXES[*]}; do
+		KEYFILE_SIZE=$(tpm_nvinfo -i $i | ${AWK} '$1 ~ /Size/ { print $3 }')
+		PERMS=$(tpm_nvinfo -i $i | ${AWK} '$1 ~ /Permissions/ { print $4 }' | grep -i read)
+
+		if [ -z "${PERMS}" ]; then
+			tpm_nvread -i $i -s ${KEYFILE_SIZE} \
+				-f ${TMPFS_KEYFILE} >/dev/null 2>&1 && return
+		else
+			if [ "${OWNERPASS}" == "-y" ]; then
+				tpm_nvread -i $i -s ${KEYFILE_SIZE} -z \
+					-f ${TMPFS_KEYFILE} >/dev/null 2>&1 && return
+			else
+				get_nv_password "Enter your TPM NVRAM password for index $i: "
+
+				tpm_nvread -i $i -s ${KEYFILE_SIZE} --password=${NVPASS} \
+					-f ${TMPFS_KEYFILE} >/dev/null 2>&1 && return
+			fi
+		fi
+	done
+
+	echo ${ERR_MSG}
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+	exit 18
+}
+
+function luks_open
+{
+	NAME=${1}
+
+	$CRYPTSETUP luksOpen ${DEVICE} ${NAME} --key-file ${TMPFS_KEYFILE} --keyfile-size ${KEYFILE_SIZE}
+	SCRIPT_RC=$?
+}
+
+#
+# luks_kill - call cryptsetup luksKillSlot
+#
+# @TMPFS_KEYFILE - the NVRAM data to extract the key from
+# @DEVICE - the LUKS device
+# @KEY_SLOT - the slot to kill
+#
+function luks_kill
+{
+	$CRYPTSETUP luksKillSlot ${DEVICE} ${KEY_SLOT} --key-file ${TMPFS_KEYFILE} --keyfile-size ${KEYFILE_SIZE}
+	SCRIPT_RC=$?
+}
+
+function usage
+{
+	echo "usage ${0##*/}: [-c|-o|-m|-r|-w|-k|-a] [options]"
+	echo -e "  -c                create a new key, store it in TPM NVRAM and add it to a"
+	echo -e	"                     LUKS keyslot"
+	echo -e "  -o <name>         get a secret from TPM NVRAM and use it to open a LUKS device"
+	echo -e "  -m                migrate NVRAM data to a new NVRAM area"
+	echo -e "  -r                retrieve NVRAM data and write to a tmpfs file"
+	echo -e "  -w <file>         write file to NVRAM"
+	echo -e "  -k                kill a LUKS key slot using a key file read from NVRAM"
+	echo -e "  -a                add a key to a LUKS key slot using a key file read from NVRAM"
+	echo
+	echo "options:"
+	echo -e "  -l <size>         use <size> bytes for a new key (default is 32)"
+	echo -e "  -s <keyslot>      use the specified LUKS key slot (view free slots with "
+	echo -e	"                     'cryptsetup luksDump <device>')"
+	echo -e "  -i <index>        use the specified TPM NVRAM index for the new area (view "
+	echo -e	"                     indexes with tpm_nvinfo)"
+	echo -e "  -d <device>       use the specified LUKS device (view with "
+	echo -e	"                     'blkid -t TYPE=crypto_LUKS')"
+	echo -e	"  -p <nvpermsfile>  use the specified NV permissions file for the new area. This"
+	echo -e	"                     is the same file you'd pass to tpm_nvdefine -f"
+	echo -e	"  -P <r/w perms>    use the specified NV read/write permissions for the new area."
+	echo -e	"                     Pass the same set of options as you'd pass to tpm_nvdefine -p"
+	echo -e "                     default is AUTHREAD|AUTHWRITE"
+	echo -e	"  -q <file>         use the specified file for the key material source, default"
+	echo -e "                     is /dev/urandom"
+	echo -e	"  -y                use the well known secret (all zeroes) as the owner password."
+	echo -e "                     This will apply both to the NV define and NV write operations"
+	echo -e "                     if they apply, as well as NV read."
+	echo -e	"  -h                help"
+}
+
+#
+# main()
+#
+KEYFILE_SIZE=32
+NVINDEX=
+ACTION="x"
+
+while getopts "kcao:mrw:l:s:i:d:p:P:q:yh" opt; do
+	case $opt in
+	k)
+		[[ "${ACTION}" == "x" ]] && ACTION="kill" || (usage && exit 255)
+		;;
+	c)
+		[[ "${ACTION}" == "x" ]] && ACTION="create" || (usage && exit 255)
+		;;
+	o)
+		[[ "${ACTION}" == "x" ]] && ACTION="open" || (usage && exit 255)
+		NAME=${OPTARG}
+		;;
+	m)
+		[[ "${ACTION}" == "x" ]] && ACTION="migrate" || (usage && exit 255)
+		;;
+	r)
+		[[ "${ACTION}" == "x" ]] && ACTION="retrieve" || (usage && exit 255)
+		;;
+	w)
+		[[ "${ACTION}" == "x" ]] && ACTION="write" || (usage && exit 255)
+		TMPFS_KEYFILE=${OPTARG}
+		;;
+	a)
+		[[ "${ACTION}" == "x" ]] && ACTION="add" || (usage && exit 255)
+		;;
+	l)
+		KEYFILE_SIZE=${OPTARG}
+		;;
+	s)
+		KEY_SLOT=${OPTARG}
+		;;
+	i)
+		NVINDEX=${OPTARG}
+		;;
+	d)
+		DEVICE=${OPTARG}
+		;;
+	p)
+		PERMSFILE=${OPTARG}
+
+		if [ -n "${PERMSFILE}" -a ! -e "${PERMSFILE}" ]; then
+			echo "Error: couldn't open ${PERMSFILE} for reading."
+			exit 21
+		fi
+		;;
+	P)
+		RW_PERMS=${OPTARG}
+		;;
+	q)
+		RAND_SOURCE=${OPTARG}
+		;;
+	y)
+		OWNERPASS="-y"
+		;;
+	*)
+		usage
+		exit 255
+		;;
+	esac
+done
+
+# always check that TPM is enabled and owned
+tpm_enabled
+tpm_owned
+
+# handle the passwords we need to gather
+echo ${RW_PERMS} | grep -qi AUTH
+DEFINE_PASS=$?
+echo ${RW_PERMS} | grep -qi AUTHWRITE
+WRITE_PASS=$?
+echo ${RW_PERMS} | grep -qi OWNER
+OWNER_WRITE=$?
+
+if [ "${ACTION}" == "create" ]; then
+	device_get
+	prompt_for_new_nvpass
+	keyfile_generate
+
+	nv_define_and_write ${PERMSFILE}
+	RC=$?
+	if [ $RC -ne 0 ]; then
+		exit $RC
+	fi
+
+	luks_add_key ${TMPFS_KEYFILE}
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+
+	echo "Using NV index ${NVINDEX} for device ${DEVICE}"
+elif [ "${ACTION}" == "open" ]; then
+	device_get
+	nv_get
+	luks_open ${NAME}
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+elif [ "${ACTION}" == "migrate" ]; then
+	nv_get
+
+	# clear NVINDEX (source to migrate from) so that find_free_nv_index
+	# will find us a new one
+	OLDNVINDEX=${NVINDEX}
+	NVINDEX=""
+	nv_define_and_write ${PERMSFILE}
+	RC=$?
+
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+	if [ $RC -ne 0 ]; then
+		exit $RC
+	fi
+	echo "Successfully migrated index ${OLDNVINDEX} to index ${NVINDEX}"
+elif [ "${ACTION}" == "retrieve" ]; then
+	nv_get
+	echo ${TMPFS_KEYFILE}
+elif [ "${ACTION}" == "write" ]; then
+	prompt_for_new_nvpass
+	KEYFILE_SIZE=$(stat -c "%s" ${TMPFS_KEYFILE})
+	nv_define_and_write ${PERMSFILE}
+elif [ "${ACTION}" == "kill" ]; then
+	if [ ! -n "${KEY_SLOT}" ]; then
+		echo "Kill requires the -s option to specify a LUKS key slot"
+		exit 255
+	fi
+
+	device_get
+	nv_get
+	luks_kill
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+elif [ "${ACTION}" == "add" ]; then
+	nv_get
+	device_get
+	luks_add_key ${TMPFS_KEYFILE}
+	wipe_file ${TMPFS_KEYFILE} ${KEYFILE_SIZE}
+else
+	usage
+	exit 1
+fi
+
+exit $SCRIPT_RC

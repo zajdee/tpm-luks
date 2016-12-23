@@ -1,0 +1,380 @@
+#!/bin/bash -e
+#
+# tpm-luks-gen-tgrub-pcr-values
+#
+# Parse a grub1 menu.lst file and generate the future TPM PCR values needed
+# to seal a system state to. Based on the implementation of the trustedgrub
+# package at http://trustedgrub.sf.net.
+#
+# Author: Kent Yoder <shpedoikal@gmail.com>
+#
+####
+# NVRAM permissions file format:
+#
+# [r/w] [PCR#] [40 byte ascii SHA-1 value]
+#
+# example:
+#
+# r 0 f952e49a7e90037fb6ee505d80a322798012db16
+# r 15 a0ea6036b734da48b57fdd0fd87218cbada887ef
+# w 12 3bd4ed7984d262f1d0d71e337ea4de290e17b4bd
+#
+# For this example, the TPM data written will only be readable when PCR 0's
+# value is f952e49a7e90037fb6ee505d80a322798012db16 and PCR 15's value is
+# a0ea6036b734da48b57fdd0fd87218cbada887ef and will only be writable when
+# PCR 12's value is 3bd4ed7984d262f1d0d71e337ea4de290e17b4bd.
+#
+####
+# How do you know which PCRs to use? The canonical reference document that
+# describes which PCRs are used for which purposes for TPM 1.2 is here:
+#
+# http://www.trustedcomputinggroup.org/files/temp/64505409-1D09-3519-AD5C611FAD3F799B/PC%20Client%20Implementation%20for%20BIOS.pdf
+#
+# See section 3.2.3. A summary for convenience:
+#
+# PCR Index	Use
+# 0		CRTM, BIOS, and Host Platform Extensions
+# 1		Host Platform Configuration
+# 2		Option ROM Code
+# 3		Option ROM Configuration and Data
+# 4		IPL Code (usually the MBR)
+# 5		IPL Code Configuration and Data
+# 6		State Transition and Wake Events
+# 7		Host Platform Manufacturer Control
+# 8-15		Used by the OS
+#
+# An explanation of the "srtm" profile (below):
+#
+# PCR 4  - record measurement of trusted grub in the MBR as measured by
+#          the BIOS
+# PCR 5  - record the IPL config - this is a record of the boot device
+#          chosen by the user
+# PCR 8  - The first 512 bytes of grub stage2
+# PCR 9  - The rest of stage2
+# PCR 12 - record trusted grub's config file command lines - note that
+#          this includes the kernel command line, so any change to the
+#          kernel command line will prevent releasing the NVRAM secret!
+# PCR 14 - record the files that trusted grub launches - kernel and
+#          initramfs
+#
+#
+TMPFILE=
+SOURCE=/sys/kernel/security/tpm0/ascii_bios_measurements
+MENU=/boot/grub/grub.cfg
+ENV=/boot/grub/grubenv
+STAGE2=/boot/grub/stage2
+CONF=/etc/tpm-luks.conf
+OUTFILE=/dev/stdout
+MODE=$([ -d /sys/firmware/efi ] && echo -n UEFI || echo -n BIOS)
+
+[ -f $CONF ] && . $CONF
+
+# use PCR list based on BIOS or UEFI boot
+if [ "x$MODE" == "xBIOS" ]; then
+    PCRS="${PCRS_BIOS}"
+else
+    PCRS="${PCRS_UEFI}"
+fi
+
+if [ -z "${PCRS}" ]; then
+	exit 0
+elif [ ! -e ${SOURCE} ]; then
+	echo "PCR measurements file not found, is securityfs mounted?" 1>&2
+	exit 255
+fi
+
+# This function computes SHA (currently SHA1) of a file in $1
+function compute_sha
+{
+	sha1sum $1 | awk '{print $1}'
+}
+
+# This function executes $1 and prints resulting hash
+# If there is any error, it prints out the stderr from $1
+#  to stderr of this script, then terminates this script
+function find_hash
+{
+	CMD=$1
+	RESULT=0
+	HASH=$($CMD 2>/tmp/tpm-luks-gen-tgrub-stderr) || RESULT=$?
+	if [ $RESULT -gt 0 ]; then
+	    echo "Error from $CMD:" 1>&2
+	    cat /tmp/tpm-luks-gen-tgrub-stderr 1>&2
+	    exit 9
+	fi
+	echo -n $HASH
+}
+
+# This function executes $1 and prints resulting hash
+# If there is any error, it prints out the stderr from $1
+#  to stderr of this script, then terminates this script
+# The only exception is the return code 99, which means
+# "print stdout from $1, but return empty hash to caller"
+function handle_shim
+{
+	CMD=$1
+	RESULT=0
+	HASH=$($CMD 2>/tmp/tpm-luks-gen-tgrub-stderr) || RESULT=$?
+	if [ $RESULT -gt 0 ]; then
+	    echo "Error from $CMD:" 1>&2
+	    cat /tmp/tpm-luks-gen-tgrub-stderr 1>&2
+	    if [ $RESULT -ne 99 ]; then
+		exit 9
+	    fi
+	fi
+	echo -n $HASH
+}
+
+# prints usage
+function usage
+{
+	echo "usage ${0##/*} [options]"
+	echo "options:"
+	echo
+	echo "  -o <file> Optional file to write NVRAM permissions files to (default is stdout)"
+	echo "  -m <file> Optional GrUB menu.lst to parse (default is ${MENU})"
+}
+
+# parse options
+while getopts "o:m:" opt; do
+	case $opt in
+	o)
+		OUTFILE=$OPTARG
+		;;
+	m)
+		MENU=$OPTARG
+		;;
+	*)
+		usage
+		exit 255
+		;;
+	esac
+done
+
+# cleanup trap - remove TMPFILE on error
+cleanup()
+{
+	rm -f $TMPFILE
+}
+
+TMPFILE=$(mktemp -q /tmp/${0##*/}-XXXXXX)
+
+if [ ! -n "$TMPFILE" ]; then
+	echo "Temp file creation failed" 1>&2
+	exit -1
+fi
+
+#trap cleanup EXIT
+
+# Simple parsing of grub.cfg (GRUB2)
+IDX=-1
+while read LINE; do
+    # for every "menuentry", increment IDX
+    if echo $LINE | egrep -qw '^menuentry'; then
+        IDX=$(( IDX + 1))
+        TITLES[$IDX]=$(echo "${LINE}" | awk -F"'" '{print $2}')
+#        echo "New IDX=$IDX, title='${TITLES[$IDX]}'"
+        KERNEL_FILES[$IDX]=""
+        CMDLINES[$IDX]=""
+        INITRD_FILES[$IDX]=""
+	MENUENTRIES[$IDX]="$LINE"
+    fi
+
+    # as long as we didn't find any menuentry, skip further steps
+    [ $IDX -lt 0 ] && continue
+
+    # search for linux(efi)?  entries and cmdlines /vmlinuz-4.4.0-53-generic.efi.signed root=UUID=25993870-4742-4723-bbbd-d22bdab6a6f9 ro quiet splash $vt_handoff
+    # the following code assumes that /boot partition is separate and files in grub.cfg refer to this partition
+    if echo $LINE | egrep -qw '^linux(efi)?'; then
+        KERNEL_FILES[$IDX]="/boot$(echo ${LINE} | awk '{ print $2 }')"
+	# multiple spaces are replaced by single space (the same as in Grub)
+        CMDLINES[$IDX]=$(echo "${LINE}" | sed 's/^linux[ \t]*//;s/^linuxefi[ \t]*//;s/[ ]\+/ /g' | tr -d "\n")
+        CMDLINES_HASH[$IDX]=$(echo -n "${CMDLINES[$IDX]}" | sha1sum | awk '{ print $1}')
+#        echo "KERNEL=${KERNEL_FILES[$IDX]}"
+#        echo "CMDLINE='${CMDLINES[$IDX]}'"
+#        echo "CMDLINEHASH=${CMDLINES_HASH[$IDX]}"
+    fi
+    # search for initrd(efi)? entries (filenames) /initrd.img-4.4.0-53-generic
+    if echo $LINE | egrep -qw '^initrd(efi)?'; then
+        INITRD_FILES[$IDX]="/boot$(echo ${LINE} | awk '{ print $2 }')"
+#        echo "INITRD=${INITRD_FILES[$IDX]}"
+    fi
+done < $MENU
+
+NUM_ENTRIES=$(( ${#KERNEL_FILES[@]} - 1 ))
+
+# default entry - search for saved entry first
+USENUM=0
+grep 'set default="${saved_entry}"' $MENU > /dev/null 2>&1 || USENUM=1
+if [ $USENUM -gt 0 ]; then
+#    echo "Using GRUB numeric default entry"
+    DEFAULT=`egrep -o 'set default="([0-9]+)"' $MENU | head -n 1 | awk -F'"' '{print $2}'`
+else
+#    echo "Using GRUB saved default entry"
+    SAVEDENTRY=`grub-editenv list | grep saved_entry | awk -F'=' '{print $2}'`
+    if [ "x$SAVEDENTRY" == "x" ]; then
+#        echo "no saved entry; set index to zero"
+	DEFAULT=0
+    else
+#        echo "saved entry='$SAVEDENTRY'"
+	DEFAULT=0
+	for e in $(seq 0 $NUM_ENTRIES); do
+	    ENTRY_LINE=${MENUENTRIES[$e]}
+	    ENTRYID=$(echo "$ENTRY_LINE" | egrep -o "menuentry_id_option '.*'" | awk -F"'" '{print $2}')
+	    if [ "x$ENTRYID" == "x" ]; then
+		ENTRYID=$e
+	    fi
+	    if [ "x$SAVEDENTRY" == "x$ENTRYID" ]; then
+#		echo "Found saved entry at $e"
+		DEFAULT=$e
+		break
+	    fi
+	done
+    fi
+fi
+
+echo "Writing PCRs for \"$MENU\" boot entries (default=$DEFAULT):"
+for e in $(seq 0 $NUM_ENTRIES); do
+
+	if [ $e -ne $DEFAULT ]; then
+		continue
+	fi
+
+	echo "Selected entry $e: \"${TITLES[$e]}\""
+	for PCRNUM in ${PCRS[@]}; do
+#		echo "PCR $PCRNUM:" 1>&2
+		AWK_STR_PCR="\$1 ~ /^${PCRNUM}\$/ { print \$1 }"
+		AWK_STR_HASH="\$1 ~ /^${PCRNUM}\$/ { print \$2 }"
+		AWK_STR_ID="\$1 ~ /^${PCRNUM}\$/ { print \$3 }"
+		MEASUREMENTS=$(cat $SOURCE | awk "$AWK_STR")
+		# clear last CURR_PCR value
+		unset CURR_PCR
+
+		j=0
+		while read LINE; do
+			# PCR
+			PCR=$(echo $LINE | awk "$AWK_STR_PCR")
+			# hash
+			m=$(echo $LINE | awk "$AWK_STR_HASH")
+			# event ID
+			EVENTID=$(echo $LINE | awk "$AWK_STR_ID")
+			if [ "x${m}" == "x" ]; then
+			    continue
+			fi
+			# check if file line (pcr #PCR) matches the PCR we work with (#PCRNUM)
+			if [ $PCR -ne $PCRNUM ]; then
+			    continue
+			fi
+
+#			# now here comes the funny part; we have to replace some of the values with our precomputed values
+			if [ "x$MODE" == "xUEFI" ]; then
+			    # In UEFI based boot, events have their IDs and the BIOSes follow the game. Just compute current values
+			    # instead of using ones stored in the measurement log.
+			    if [[ $PCRNUM -eq 4 && "x$EVENTID" == "x80000003" ]]; then
+				# replace hash from ascii_bios_measurements. detect default UEFI boot manager
+				m=$(find_hash tpm-luks-findefibootmgr)
+#				echo "Precalculated hash for PCR[4] (UEFI bootloader): $m" 1>&2
+			    fi
+			    if [[ $PCRNUM -eq 5 && "x$EVENTID" == "x80000006" ]]; then
+				# replace hash from ascii_bios_measurements. detect GPT of disk where the EFI partition is
+				m=$(find_hash tpm-luks-findefibootgpt)
+#				echo "Precalculated hash for PCR[5] (UEFI GPT data): $m" 1>&2
+			    fi
+			else
+			    # Measuring MBR can get tricky in BIOS based boot.
+			    # PCR[4] may be filled with event ID 0c (Compact Hash) or 0d (IPL code) 
+			    # PCR[5] may be filled with event ID 05 (Compact Hash) or 0e (IPL data)
+			    # Other events in PCR[4] and PCR[5] must be processed "as is"
+			    if [ $PCRNUM -eq 4 ]; then
+				if [[ "x$EVENTID" == "x0c" || "x$EVENTID" == "x0d" ]]; then
+				    # replace hash from ascii_bios_measurements. Load MBR code and hash it
+				    m=$(find_hash tpm-luks-findbiosbootcode)
+#				    echo "Precalculated hash for PCR[4] (BIOS MBR code): $m" 1>&2
+				fi
+			    fi
+			    if [ $PCRNUM -eq 5 ]; then
+				if [[ "x$EVENTID" == "x0c" || "x$EVENTID" == "x0e" ]]; then
+				    # replace hash from ascii_bios_measurements. Load MBR data and hash it
+				    m=$(find_hash tpm-luks-findbiosbootdata)
+#				    echo "Precalculated hash for PCR[5] (BIOS MBR data): $m" 1>&2
+				fi
+			    fi
+			fi
+
+			if [ $j -eq 0 ]; then
+			    CURR_PCR=$(tpm-luks-chain-hashes -o $TMPFILE -h $m)
+			else
+			    CURR_PCR=$(tpm-luks-chain-hashes -f $TMPFILE -o $TMPFILE -h $m)
+			fi
+
+			j=1
+		done < $SOURCE
+		# it is possible that some PCR did not receive any measurement at all - therefore is zero
+		# we shall fill it with "no hash" (20 bytes of zeroes)
+		if [ -z "$CURR_PCR" ]; then
+		    CURR_PCR="0000000000000000000000000000000000000000"
+		fi
+
+		# Sitting in $TMPFILE is the binary hash value of $PCRNUM at the point in
+		# time where the BIOS launched the MBR.
+		#
+		# Using $TMPFILE as a starting point, continue the chaining process
+
+		# XXX TODO Checkfile support in PCR13
+		case $PCRNUM in
+		8)
+			### GRUB-modules
+			### can be zero ("0000000000000000000000000000000000000000")
+			### if all modules are built-in and no module is loaded from disk
+			### we currently do not measure modules here - we just take current PCR[8] value and use it
+			echo "r $PCRNUM $CURR_PCR" >> ${OUTFILE}
+			;;
+		9)
+			### GRUB2 core. PCR[9] MUST NOT contain 
+			### anything else than the measurements defined below.
+			if [ "x$MODE" == "xUEFI" ]; then
+			    ##  UEFI boot measurements (ordered list):
+			    ### sha1sum of GRUBX64.EFI (if SHIM used; otherwise this step is skipped)
+			    HASH=$(handle_shim tpm-luks-findefishimhash)
+			    ### calculate kernel hash (sha1sum /boot/kernel)
+			    ### calculate cmdline hash (echo -n "..." | sha1sum)
+			    ### calculate initrd hash (sha1sum /boot/initrd)
+			    HASH="${HASH} $(compute_sha ${KERNEL_FILES[$e]}) ${CMDLINES_HASH[$e]} $(compute_sha ${INITRD_FILES[$e]})"
+#			    echo "UEFI: $HASH"
+			else
+			    ##  BIOS boot measurements (ordered list):
+			    ### calculate stage1.5 hash
+			    ### calculate stage2 hash (works with GPT/BiosBootPartition as well!)
+			    HASH="$(find_hash tpm-luks-findbiosgrubstage15) $(find_hash tpm-luks-findbiosgrubstage2)"
+			    ### calculate kernel hash (sha1sum /boot/kernel)
+			    ### calculate cmdline hash (echo -n "..." | sha1sum)
+			    ### calculate initrd hash (sha1sum /boot/initrd)
+			    HASH="$HASH $(compute_sha ${KERNEL_FILES[$e]}) ${CMDLINES_HASH[$e]} $(compute_sha ${INITRD_FILES[$e]})"
+#			    echo "BIOS: $HASH"
+			fi
+			CURR_PCR=$(tpm-luks-chain-hashes -o $TMPFILE -h $HASH)
+			echo "r $PCRNUM $CURR_PCR" >> ${OUTFILE}
+			;;
+#		11)
+#			### FIXME: all commands executed from grub.cfg up until kernel launch.
+#			### This is EXTREMELY HARD to precompute for Ubuntu. We can follow commands present in
+#			### measurement log, but for now we do not precompute PCR[11]
+#			;;
+#		15)
+#			CURR_PCR=$(tpm-luks-chain-hashes -o $TMPFILE -h ${CMDLINES[$e]})
+#			echo "r $PCRNUM $CURR_PCR" >> ${OUTFILE}
+#			#echo "w $PCRNUM $CURR_PCR"
+#			;;
+#		14)
+#			CURR_PCR=$(tpm-luks-chain-hashes -o $TMPFILE ${KERNEL_FILES[$e]} ${INITRD_FILES[$e]})
+#			echo "r $PCRNUM $CURR_PCR" >> ${OUTFILE}
+#			#echo "w $PCRNUM $CURR_PCR"
+#			;;
+		*)
+			echo "r $PCRNUM $CURR_PCR" >> ${OUTFILE}
+			;;
+		esac
+	done
+done
+
+exit 0

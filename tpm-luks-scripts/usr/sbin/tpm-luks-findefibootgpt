@@ -1,0 +1,43 @@
+#!/bin/bash
+
+echoerr() { echo "$@" 1>&2; }
+
+MODE=$([ -d /sys/firmware/efi ] && echo -n UEFI || echo -n BIOS)
+if [ "x$MODE" == "xBIOS" ]; then
+    echoerr "This script is for UEFI boot only."
+    exit 9
+fi
+
+BOOTCURRENT=`efibootmgr -v | grep 'BootCurrent' | awk '{print $2}'`
+if [ -z "$BOOTCURRENT" ]; then
+    echoerr "Unable to determine current boot entry number"
+    exit 1
+fi
+EFIENTRY=`efibootmgr -v | grep Boot${BOOTCURRENT} | egrep -o '[a-zA-Z0-9.,()/\-]*' | grep .efi`
+if [ -z "$EFIENTRY" ]; then
+    echoerr "Unable to determine current boot entry data"
+    exit 2
+fi
+echoerr "EFIENTRY=$EFIENTRY" 
+UUID=`echo $EFIENTRY | awk -F, '{print $3}'`
+if [ -z "$UUID" ]; then
+    echoerr "Unable to determine current boot entry UUID"
+    exit 3
+fi
+echoerr "UUID=$UUID"
+# searches all disks. uses sfdisk to dump uuids on each disk. greps for the $UUID. if there are multiple matches
+# (should not occur), select the first and only
+EFIDISK=`for disk in /dev/sd?; do sfdisk -d $disk | grep -i uuid=$UUID | awk '{print $1}'; done | head -n 1`
+if [ -z "$EFIDISK" ]; then
+    echoerr "Unable to determine current boot entry UUID disk (is the partition still present?)"
+    exit 4
+fi
+echoerr "EFIDISK=$EFIDISK"
+LOADERDRIVE=`echo $EFIDISK | sed 's/[0-9]*$//g'`
+if [ -z "$LOADERDRIVE" ]; then
+    echoerr "Unable to determine current boot entry UUID disk (is the disk present?)"
+    exit 5
+fi
+echoerr "LOADERDRIVE=$LOADERDRIVE"
+echoerr "Hashing $LOADERDRIVE"
+pcrsum -e -p $LOADERDRIVE

@@ -1,0 +1,7 @@
+tpm-luks for Debian
+------------------
+
+Original shpedoikal's tpm-luks [https://github.com/shpedoikal/tpm-luks] modified for Ubuntu
+See https://github.com/zajdee/tpm-luks for complete source and comments.
+
+ -- Radek Zajic <radek@zajic.v.pytli.cz>  Thu, 22 Dec 2016 17:45:41 +0100

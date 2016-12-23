@@ -1,0 +1,103 @@
+#!/bin/bash -e
+#
+# tpm-luks-update: For each entry in the config file, run the script to
+#		   regenerate its PCR values, then run tpm-luks to migrate
+#		   its secret to a new NVRAM index sealed to the new PCRs
+#
+CONF=/etc/tpm-luks.conf
+NVPERMSFILE=$(mktemp /tmp/${0##*/}-XXXXXX)
+
+function cleanup
+{
+	echo $MSG
+	rm -f ${NVPERMSFILE}
+}
+
+trap cleanup EXIT
+
+. $CONF
+
+AWK=awk
+TPM_LUKS_SIZE=32
+NVPERMSFILE=$(mktemp /tmp/${0##*/}-XXXXXX)
+
+function find_used_nv_indexes
+{
+        echo "Generating PCR values..."
+        $TPM_LUKS_GENPCR -o ${NVPERMSFILE}
+        if [ $? -ne 0 ]; then
+                echo "$TPM_LUKS_GENPCR has failed."
+                return
+        fi
+
+        # start at index 1, making the default first index to use 2. In
+        # testing, the Atmel TPM threw errors if NV index 1 was used
+        NV_INDEX=2
+        NV_USED_INDEXES=( $(tpm_nvinfo | ${AWK} '$1$2 ~ /NVRAMindex/ { print $4 }') )
+        NV_USED_SIZES=( $(tpm_nvinfo | ${AWK} '$1$2 ~ /Size/ { print $3 }') )
+        NUM_INDEXES=$(( ${#NV_USED_INDEXES[@]} - 1 ))
+        NUM_SIZES=$(( ${#NV_USED_SIZES[@]} - 1 ))
+
+        if [ -z $NUM_SIZES -o -z $NUM_INDEXES ]; then
+            echo "tpm_nvinfo error - unable to fetch existing indexes" 1>&2
+            return 1
+        fi
+
+        # iterate through NV indexes $TPM_LUKS_NV_INDEX_LIMIT_MIN..$TPM_LUKS_NV_INDEX_LIMIT_MAX
+        # compare current index with $NV_USED_INDEXES
+        # if the index is not yet used, return it
+        # take care of NV_USED_INDEXES - tpm_nvinfo returns data in HEX
+	### FIXME: if no PCR entry can be read, do NOT release any of them!
+	### FIXME: Take MIN/MAX into account not to break other distros' NVRAM entries
+
+        HAVE_KEYS=0
+        for d in $(seq 0 $NUM_INDEXES); do
+                # fetch index and convert it from hex to dec
+                NV_INDEX=$(( ${NV_USED_INDEXES[$d]} ))
+                NV_SIZE=${NV_USED_SIZES[$d]}
+                [ $NV_SIZE -ne $TPM_LUKS_SIZE ] && continue
+                [ $NV_INDEX -lt $TPM_LUKS_NV_INDEX_LIMIT_MIN ] && continue
+                [ $NV_INDEX -gt $TPM_LUKS_NV_INDEX_LIMIT_MAX ] && continue
+                echo "Found NVRAM index: $NV_INDEX, size: $NV_SIZE"
+                CANREAD=1
+                FILENAME=$(tpm-luks -r -i $NV_INDEX) || CANREAD=0
+                if [ $CANREAD -eq 0 ]; then
+                    echo "Index $NV_INDEX cannot be read. Removing from NVRAM..."
+                    tpm_nvrelease -i $NV_INDEX --pwdo=$OWNERPASS
+                    continue
+                else
+                    SHA1NAME=$(sha1sum $FILENAME | awk '{print $1}')
+                    echo "Index $NV_INDEX was read into file $FILENAME and has sha1sum $SHA1NAME"
+                    mv -u $FILENAME /dev/shm/lukskey$SHA1NAME
+                    HAVE_KEYS=1
+                fi
+        done
+
+        if [ $HAVE_KEYS -eq 0 ]; then
+            # no keys set up in TPM, just terminate
+            return
+        fi
+
+        # now search for files to be migrated and store these into NVRAM
+        MIGRATE_FILES=( $(ls /dev/shm/lukskey*) )
+        NUM_FILES=$(( ${#MIGRATE_FILES[@]} - 1))
+        for d in $(seq 0 $NUM_FILES); do
+                FILENAME=${MIGRATE_FILES[$d]}
+                echo "Storing key from $FILENAME into NVRAM..."
+                MSG=$(tpm-luks -w $FILENAME -p ${NVPERMSFILE})
+                echo $MSG
+                if [ $? -ne 0 ]; then
+                    echo "Unable to migrate key from $FILENAME into NVRAM. File NOT DELETED, please migrate yourself!"
+                    continue
+                fi
+                NEWINDEX=$(echo ${MSG} | awk '$1 ~ /Successfully/ { print $11 }')
+                NEWINDEX=$(( ${NEWINDEX} ))
+                echo "Success. Migrated $FILENAME into NVRAM, new index $NEWINDEX."
+                rm -f $FILENAME
+        done
+
+        rm -f ${NVPERMSFILE}
+}
+find_used_nv_indexes
+
+exit 0

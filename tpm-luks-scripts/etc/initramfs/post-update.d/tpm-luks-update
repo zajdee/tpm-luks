@@ -1,0 +1,101 @@
+#!/bin/bash
+
+INITRD_UPDATED="$2"
+
+# if the initrd is not specified on command line, exit
+if [ -z "$INITRD_UPDATED" ]; then
+    exit 0
+fi
+
+# if there is no TPM-enabled file, exit
+if [ ! -f /sys/class/tpm/tpm0/enabled ]; then
+    exit 0
+fi
+
+# if the TPM is present, but not enabled, then quit
+if ! grep -qi 1 /sys/class/tpm/tpm0/enabled; then
+    exit 0
+fi
+
+# if the TPM is present, but not owned, then quit
+if ! grep -qi 1 /sys/class/tpm/tpm0/owned; then
+    exit 0
+fi
+
+. /etc/tpm-luks.conf
+
+# both owner and nvram password must be set for the tpm-luks-update to work
+if [ -z "$OWNERPASS" -o -z "$NVPASS" ]; then
+    echo "Owner pass or NVRAM password not set!"
+    exit 0
+fi
+
+# initrd updates must be enabled in the configuration file /etc/tpm-luks.conf
+if [ "x$TPM_INITRD_ENABLED" != "x1" ]; then
+    exit 0
+fi
+
+MENU=/boot/grub/grub.cfg
+
+# Simple parsing of grub.cfg (GRUB2)
+IDX=-1
+while read LINE; do
+    # for every "menuentry", increment IDX
+    if echo $LINE | egrep -qw '^menuentry'; then
+        IDX=$(( IDX + 1))
+        TITLES[$IDX]=$(echo "${LINE}" | awk -F"'" '{print $2}')
+        KERNEL_FILES[$IDX]=""
+        CMDLINES[$IDX]=""
+        INITRD_FILES[$IDX]=""
+        MENUENTRIES[$IDX]="$LINE"
+    fi
+
+    # as long as we didn't find any menuentry, skip further steps
+    [ $IDX -lt 0 ] && continue
+
+    # search for linux(efi)?  entries and cmdlines /vmlinuz-4.4.0-53-generic.efi.signed root=UUID=25993870-4742-4723-bbbd-d22bdab6a6f9 ro quiet splash $vt_handoff
+    # the following code assumes that /boot partition is separate and files in grub.cfg refer to this partition
+    if echo $LINE | egrep -qw '^linux(efi)?'; then
+        KERNEL_FILES[$IDX]="/boot$(echo ${LINE} | awk '{ print $2 }')"
+        # multiple spaces are replaced by single space (the same as in Grub)
+        CMDLINES[$IDX]=$(echo "${LINE}" | sed 's/^linux[ \t]*//;s/^linuxefi[ \t]*//;s/[ ]\+/ /g' | tr -d "\n")
+        CMDLINES_HASH[$IDX]=$(echo -n "${CMDLINES[$IDX]}" | sha1sum | awk '{ print $1}')
+    fi
+    # search for initrd(efi)? entries (filenames) /initrd.img-4.4.0-53-generic
+    if echo $LINE | egrep -qw '^initrd(efi)?'; then
+        INITRD_FILES[$IDX]="/boot$(echo ${LINE} | awk '{ print $2 }')"
+    fi
+done < $MENU
+
+NUM_ENTRIES=$(( ${#KERNEL_FILES[@]} - 1 ))
+
+# default entry - search for saved entry first
+USENUM=0
+grep 'set default="${saved_entry}"' $MENU > /dev/null 2>&1 || USENUM=1
+if [ $USENUM -gt 0 ]; then
+#    echo "Using GRUB numeric default entry"
+    DEFAULT=`egrep -o 'set default="([0-9]+)"' $MENU | head -n 1 | awk -F'"' '{print $2}'`
+else
+    SAVEDENTRY=`grub-editenv list | grep saved_entry | awk -F'=' '{print $2}'`
+    if [ "x$SAVEDENTRY" == "x" ]; then
+        DEFAULT=0
+    else
+        DEFAULT=0
+        for e in $(seq 0 $NUM_ENTRIES); do
+            ENTRY_LINE=${MENUENTRIES[$e]}
+            ENTRYID=$(echo "$ENTRY_LINE" | egrep -o "menuentry_id_option '.*'" | awk -F"'" '{print $2}')
+            if [ "x$ENTRYID" == "x" ]; then
+                ENTRYID=$e
+            fi
+            if [ "x$SAVEDENTRY" == "x$ENTRYID" ]; then
+                DEFAULT=$e
+                break
+            fi
+        done
+    fi
+fi
+
+# only run tpm-luks-update if the initrd for latest grub entry has been updated
+if [ "${INITRD_FILES[$DEFAULT]}" == "${INITRD_UPDATED}" ]; then
+    tpm-luks-update
+fi

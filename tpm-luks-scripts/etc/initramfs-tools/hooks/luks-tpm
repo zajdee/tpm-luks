@@ -1,0 +1,28 @@
+#!/bin/sh
+
+PREREQ=""
+
+prereqs()
+{
+    echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+if [ ! -x /usr/sbin/nv_readvalue ]; then
+    exit 0
+fi
+if [ ! -x /usr/sbin/getcapability ]; then
+    exit 0
+fi
+
+. /usr/share/initramfs-tools/hook-functions
+
+copy_exec /usr/sbin/nv_readvalue
+copy_exec /usr/sbin/getcapability
+egrep '(TPM_LUKS_NV|NVPASS)' /etc/tpm-luks.conf > "${DESTDIR}/etc/tpm-luks.conf"

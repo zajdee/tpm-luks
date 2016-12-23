@@ -1,0 +1,25 @@
+#!/bin/bash
+
+echoerr() { echo "$@" 1>&2; }
+
+MODE=$([ -d /sys/firmware/efi ] && echo -n UEFI || echo -n BIOS)
+if [ "x$MODE" == "xUEFI" ]; then
+    echoerr "This script is for BIOS boot only."
+    exit 9
+fi
+
+# simply check for /boot partition - it should be mounted
+BIOSDISK=`df -P /boot | awk 'NR==2{print $1}'`
+if [ -z "$BIOSDISK" ]; then
+    echoerr "Unable to determine current mountpoint of /boot (is the partition mounted?)"
+    exit 4
+fi
+echoerr "BIOSDISK=$BIOSDISK"
+LOADERDRIVE=`echo $BIOSDISK | sed 's/[0-9]*$//g'`
+if [ -z "$LOADERDRIVE" ]; then
+    echoerr "Unable to determine disk used for /boot (should not happen!)"
+    exit 5
+fi
+echoerr "LOADERDRIVE=$LOADERDRIVE"
+echoerr "Hashing $LOADERDRIVE MBR code"
+pcrsum -l $LOADERDRIVE

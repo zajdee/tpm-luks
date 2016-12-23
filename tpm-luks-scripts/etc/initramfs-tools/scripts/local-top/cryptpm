@@ -1,0 +1,357 @@
+#!/bin/sh
+
+PREREQ="cryptroot-prepare"
+
+#
+# Standard initramfs preamble
+#
+prereqs()
+{
+        # Make sure that cryptroot is run last in local-top
+        for req in $(dirname $0)/*; do
+                script=${req##*/}
+                if [ $script != cryptroot ]; then
+                        echo $script
+                fi
+        done
+}
+
+case $1 in
+prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+
+# source for log_*_msg() functions, see LP: #272301
+. /scripts/functions
+
+#
+# Helper functions
+#
+message()
+{
+        if [ -x /bin/plymouth ] && plymouth --ping; then
+                plymouth message --text="$@"
+        else
+                echo "$@" >&2
+        fi
+        return 0
+}
+
+udev_settle()
+{
+        # Wait for udev to be ready, see https://launchpad.net/bugs/85640
+        if command -v udevadm >/dev/null 2>&1; then
+                udevadm settle --timeout=30
+        elif command -v udevsettle >/dev/null 2>&1; then
+                udevsettle --timeout=30
+        fi
+        return 0
+}
+
+parse_options()
+{
+        local cryptopts
+        cryptopts="$1"
+
+        if [ -z "$cryptopts" ]; then
+                return 1
+        fi
+
+        # Defaults
+        cryptcipher=aes-cbc-essiv:sha256
+        cryptsize=256
+        crypthash=ripemd160
+        crypttarget=cryptroot
+        cryptsource=""
+        cryptheader=""
+        cryptlvm=""
+        cryptkeyscript=""
+        cryptkey="" # This is only used as an argument to an eventual keyscript
+        cryptkeyslot=""
+        crypttries=3
+        crypttcrypt=""
+        cryptveracrypt=""
+        cryptrootdev=""
+        cryptdiscard=""
+        CRYPTTAB_OPTIONS=""
+
+        local IFS=" ,"
+        for x in $cryptopts; do
+                case $x in
+                hash=*)
+                        crypthash=${x#hash=}
+                        ;;
+                size=*)
+                        cryptsize=${x#size=}
+                        ;;
+                cipher=*)
+                        cryptcipher=${x#cipher=}
+                        ;;
+                target=*)
+                        crypttarget=${x#target=}
+                        export CRYPTTAB_NAME="$crypttarget"
+                        ;;
+                source=*)
+                        cryptsource=${x#source=}
+                        if [ ${cryptsource#UUID=} != $cryptsource ]; then
+                                cryptsource="/dev/disk/by-uuid/${cryptsource#UUID=}"
+                        elif [ ${cryptsource#LABEL=} != $cryptsource ]; then
+                                cryptsource="/dev/disk/by-label/${cryptsource#LABEL=}"
+                        fi
+                        export CRYPTTAB_SOURCE="$cryptsource"
+                        ;;
+                header=*)
+                        cryptheader=${x#header=}
+                        if [ ! -e "$cryptheader" ] && [ -e "/conf/conf.d/cryptheader/$cryptheader" ]; then
+                                cryptheader="/conf/conf.d/cryptheader/$cryptheader"
+                        fi
+                        export CRYPTTAB_HEADER="$cryptheader"
+                        ;;
+                lvm=*)
+                        cryptlvm=${x#lvm=}
+                        ;;
+                keyscript=*)
+                        cryptkeyscript=${x#keyscript=}
+                        ;;
+                key=*)
+                        if [ "${x#key=}" != "none" ]; then
+                                cryptkey=${x#key=}
+                        fi
+                        export CRYPTTAB_KEY="$cryptkey"
+                        ;;
+                keyslot=*)
+                        cryptkeyslot=${x#keyslot=}
+                        ;;
+                tries=*)
+                        crypttries="${x#tries=}"
+                        case "$crypttries" in
+                          *[![:digit:].]*)
+                                crypttries=3
+                                ;;
+                        esac
+                        ;;
+                tcrypt)
+                        crypttcrypt="yes"
+                        ;;
+                veracrypt)
+                        cryptveracrypt="--veracrypt"
+                        ;;
+                rootdev)
+                        cryptrootdev="yes"
+                        ;;
+                discard)
+                        cryptdiscard="yes"
+                        ;;
+                esac
+                PARAM="${x%=*}"
+                if [ "$PARAM" = "$x" ]; then
+                        VALUE="yes"
+                else
+                        VALUE="${x#*=}"
+                fi
+                CRYPTTAB_OPTIONS="$CRYPTTAB_OPTIONS $PARAM"
+                eval export CRYPTTAB_OPTION_$PARAM="\"$VALUE\""
+        done
+        export CRYPTTAB_OPTIONS
+
+        if [ -z "$cryptsource" ]; then
+                message "cryptsetup: source parameter missing"
+                return 1
+        fi
+        return 0
+}
+
+activate_vg()
+{
+        # Sanity checks
+        if [ ! -x /sbin/lvm ]; then
+                message "cryptsetup: lvm is not available"
+                return 1
+        fi
+
+        # Detect and activate available volume groups
+        /sbin/lvm vgscan
+        /sbin/lvm vgchange -a y --sysinit
+        return $?
+}
+
+setup_mapping()
+{
+        local opts count cryptopen cryptremove NEWROOT
+        opts="$1"
+
+        if [ -z "$opts" ]; then
+                return 0
+        fi
+
+        parse_options "$opts" || return 1
+	tpmount $cryptsource $crypttarget
+}
+
+tpmount()
+{
+        #
+        # package reqs: od, getcapability, nv_readvalue, dd
+        #
+        # Author: Kent Yoder <shpedoikal@gmail.com>
+        #
+
+        # include config
+        . /etc/tpm-luks.conf
+
+        CRYPTSETUP=/sbin/cryptsetup
+        MOUNT=/bin/mount
+        UMOUNT=/bin/umount
+        TPM_NVREAD=/usr/sbin/nv_readvalue
+        GETCAP=/usr/sbin/getcapability
+        AWK=/bin/awk
+        DEVICE=$1
+        NAME=$2
+
+        if [ -z "$DEVICE" ]; then
+            return 0
+        fi
+        if [ -z "$NAME" ]; then
+            return 0
+        fi
+
+        #set -x
+
+        VIABLE_INDEXES=""
+
+        #
+        # An index is viable if its composite hash matches current PCR state, or if
+        # it doesn't require PCR state at all
+        #
+        ALL_INDEXES=$($GETCAP -cap 0xd | ${AWK} -F: '$1 ~ /Index/ {print $2 }' | ${AWK} -F= '{ print $1 }' )
+        for i in $ALL_INDEXES; do
+        	HEXI=$(printf "0x%x" $i)
+        	MATCH1=$($GETCAP -cap 0x11 -scap $HEXI | ${AWK} -F ": " '$1 ~ /Matches/ { print $2 }')
+        	SIZE=$($GETCAP -cap 0x11 -scap $HEXI | ${AWK} -F= '$1 ~ /dataSize/ { print $2 }')
+        	if [ -n "${MATCH1}" -a "${MATCH1}" = "Yes" ]; then
+        		# Add this index at the beginning, since its especially likely to be
+        		# the index we're looking for
+        		VIABLE_INDEXES="$i $VIABLE_INDEXES"
+        		message "TPM: PCR composite matches for index: $i"
+        		continue
+        	elif [ $i -lt ${TPM_LUKS_NV_INDEX_LIMIT_MIN} ]; then
+        		continue
+        	elif [ $i -gt ${TPM_LUKS_NV_INDEX_LIMIT_MAX} ]; then
+        		continue
+        	fi
+
+        	# Add this index at the end of the list
+        	VIABLE_INDEXES="$VIABLE_INDEXES $i"
+        	message "TPM: Viable index: $i"
+        done
+
+        TMPFS_MNT=/tmp/cryptroot-mnt
+        if [ ! -d ${TMPFS_MNT} ]; then
+        	mkdir ${TMPFS_MNT} || exit -1
+        fi
+
+        $MOUNT -t tmpfs -o size=16K tmpfs ${TMPFS_MNT}
+        if [ $? -ne 0 ]; then
+        	message "TPM: Unable to mount tmpfs area to securely use TPM NVRAM data."
+        	exit 255
+        fi
+
+        # plymouth feeds in this password for us
+        if [ ! -n "${NVPASS}" ]; then
+               read -s -p "TPM: Enter NVRAM password: " NVPASS
+        fi
+
+        KEYFILE=${TMPFS_MNT}/key
+
+        for NVINDEX in $VIABLE_INDEXES; do
+        	HEXI=$(printf "0x%x" $NVINDEX)
+        	NVSIZE=$($GETCAP -cap 0x11 -scap ${HEXI} | ${AWK} -F= '$1 ~ /dataSize/ { print $2 }')
+
+        	$TPM_NVREAD -ix ${HEXI} -pwdd ${NVPASS} \
+        		-sz ${NVSIZE} -of ${KEYFILE} >/dev/null 2>&1
+        	RC=$?
+        	if [ ${RC} -eq 1 ]; then
+        		message "TPM NV index ${NVINDEX}: Bad password."
+        		continue
+        	elif [ ${RC} -eq 24 ]; then
+        		message "TPM NV index ${NVINDEX}: PCR mismatch."
+        		continue
+        	elif [ ${RC} -eq 2 ]; then
+        		message "TPM NV index ${NVINDEX}: Invalid NVRAM Index."
+        		continue
+        	elif [ ${RC} -ne 0 ]; then
+        		message "TPM NV index ${NVINDEX}: Unknown error (${RC})"
+        		continue
+        	fi
+
+        	message "TPM: Trying data read from NV index $NVINDEX"
+        	$CRYPTSETUP luksOpen ${DEVICE} ${NAME} --key-file ${KEYFILE} --keyfile-size ${NVSIZE}
+        	RC=$?
+        	# Zeroize keyfile regardless of success/fail
+        	dd if=/dev/zero of=${KEYFILE} bs=1c count=${NVSIZE} >/dev/null 2>&1
+        	if [ ${RC} -ne 0 ]; then
+        		message "TPM: Cryptsetup failed, trying next index..."
+        		continue
+        	fi
+        	message "TPM: Success."
+        	${UMOUNT} ${TMPFS_MNT}
+        
+        	exit 0
+        done
+
+        # NVRAM cannot be accessed. Fall back to LUKS passphrase
+        message "TPM: Unable to unlock an NVRAM area."
+        ${UMOUNT} ${TMPFS_MNT}
+        #exit 255
+}
+
+#
+# Begin real processing
+#
+
+# Do we have any kernel boot arguments?
+cmdline_cryptopts=''
+unset cmdline_root
+for opt in $(cat /proc/cmdline); do
+        case $opt in
+        cryptopts=*)
+                opt="${opt#cryptopts=}"
+                if [ -n "$opt" ]; then
+                        if [ -n "$cmdline_cryptopts" ]; then
+                                cmdline_cryptopts="$cmdline_cryptopts $opt"
+                        else
+                                cmdline_cryptopts="$opt"
+                        fi
+                fi
+                ;;
+        root=*)
+                opt="${opt#root=}"
+                case $opt in
+                /*) # Absolute path given. Not lilo major/minor number.
+                        cmdline_root=$opt
+                        ;;
+                *) # lilo major/minor number (See #398957). Ignore
+                esac
+                ;;
+        esac
+done
+
+if [ -n "$cmdline_cryptopts" ]; then
+        # Call setup_mapping separately for each possible cryptopts= setting
+        for cryptopt in $cmdline_cryptopts; do
+                setup_mapping "$cryptopt"
+        done
+        exit 0
+fi
+
+# Do we have any settings from the /conf/conf.d/cryptroot file?
+if [ -r /conf/conf.d/cryptroot ]; then
+        while read mapping <&3; do
+                setup_mapping "$mapping" 3<&-
+        done 3< /conf/conf.d/cryptroot
+fi
+
+exit 0

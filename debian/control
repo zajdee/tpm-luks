@@ -1,0 +1,20 @@
+Source: tpm-luks
+Section: admin
+Priority: extra
+Maintainer: Radek Zajic <radek@zajic.v.pytli.cz>
+Build-Depends: debhelper (>= 9),
+ libssl-dev, gnu-efi, libmd-dev
+Standards-Version: 3.9.8
+Homepage: https://github.com/zajdee/tpm-luks
+
+Package: tpm-luks
+Architecture: any-i386 any-amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, trousers, tpm-tools, binutils, mawk, efibootmgr, grep, coreutils, util-linux, sed, bash, cryptsetup-bin, grub-common
+Description: Tools to manage your LUKS keys in TPM
+ When your system is properly measured using measured boot, you can
+ securely store LUKS keys within the Trusted Platform Module (TPM).
+ These tools enable you to initialize the LUKS volume and TPM,
+ bind the stored keys to predefined values of Platform Control
+ Registers (PCRs) and manage the keys in TPM on update of critical
+ system files (boot loaders, kernels, initramdisks and kernel cmdline).
+

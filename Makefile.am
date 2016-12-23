@@ -1,0 +1,1 @@
+SUBDIRS = pcrsum swtpm-utils .

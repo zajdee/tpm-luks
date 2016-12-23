@@ -1,0 +1,45 @@
+#!/bin/bash -e
+#
+# tpm-luks-init: For each entry in the config file, run the script to
+#		 generate its PCR values, then run tpm-luks to create a
+#		 new TPM NVRAM secret for it
+#
+#
+CONF=/etc/tpm-luks.conf
+NVPERMSFILE=$(mktemp /tmp/${0##*/}-XXXXXX)
+
+function cleanup
+{
+	rm -f ${NVPERMSFILE}
+}
+
+. $CONF
+
+trap cleanup EXIT
+echo ${DEVICES}
+IFS=' ' read -r -a DEVICES <<< "${DEVICE}"
+NUM_DEVICES=$(( ${#DEVICES[@]} - 1 ))
+
+if [ $NUM_DEVICES -lt 0 ]; then
+	echo "${CONF} parse error (no LUKS devices defined)" 1>&2
+	exit 1
+fi
+
+for d in $(seq 0 $NUM_DEVICES); do
+	echo "Generating PCR values for ${DEVICES[$d]}..."
+	$TPM_LUKS_GENPCR -o ${NVPERMSFILE}
+	if [ $? -ne 0 ]; then
+		echo "${SCRIPTS[$d]} has failed. Aborting."
+		exit 2
+	fi
+
+	echo "Creating new TPM NVRAM secret for ${DEVICES[$d]}..."
+	tpm-luks -c -d ${DEVICES[$d]} -p ${NVPERMSFILE}
+	if [ $? -ne 0 ]; then
+		echo "tpm-luks has failed. Aborting."
+		exit 3
+	fi
+	rm -f ${NVPERMSFILE}
+done
+
+exit 0
