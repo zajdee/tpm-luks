@@ -43,7 +43,8 @@ echoerr "UUID=$UUID, EFIFILE=$EFIFILE"
 
 # searches all disks. uses sfdisk to dump uuids on each disk. greps for the $UUID. if there are multiple matches
 # (should not occur), select the first and only
-EFIDISK=`for disk in /dev/sd?; do sfdisk -d $disk | grep -i uuid=$UUID | awk '{print $1}'; done | head -n 1`
+DRIVES=`lsblk | grep disk | awk '{print $1}'`
+EFIDISK=`for disk in ${DRIVES}; do sfdisk -d $disk | grep -i uuid=$UUID | awk '{print $1}'; done | head -n 1`
 if [ -z "$EFIDISK" ]; then
     echoerr "Unable to determine current boot entry UUID disk (is the partition still present?)"
     exit 4
