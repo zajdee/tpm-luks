@@ -52,10 +52,11 @@ LIBS=-lcrypto -lssl
 # scripts as part of bnuilding the initramfs. The 'inst_binary' script
 # only looks in a few places, and /usr/local/bin isn't one of them
 bindir=/usr/sbin
-bin_PROGRAMS = getcapability nv_readvalue
+bin_PROGRAMS = getcapability nv_readvalue pcr-extend
 
 getcapability_SOURCES = getcapability.c
 nv_readvalue_SOURCES = nv_readvalue.c
+pcr_extend_SOURCES = pcr-extend.c
 
 noinst_HEADERS = \
 	include/hmac.h \
