@@ -2,9 +2,7 @@
 
 ## What is this about?
 
-**TL;DR:**
-
-Now you can have LUKS-encrypted root filesystem in your Ubuntu 16.10/17.04 without the need to enter password during boot.
+**TL;DR:** Now you can have LUKS-encrypted root filesystem in your Ubuntu 16.10/17.04 without the need to enter password during boot.
 
 **Tell me more:**
 
