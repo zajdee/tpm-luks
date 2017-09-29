@@ -290,12 +290,19 @@ tpmount()
         	message "TPM: Trying data read from NV index $NVINDEX"
         	$CRYPTSETUP luksOpen ${DEVICE} ${NAME} --key-file ${KEYFILE} --keyfile-size ${NVSIZE}
         	RC=$?
-        	# Zeroize keyfile regardless of success/fail
-        	dd if=/dev/zero of=${KEYFILE} bs=1c count=${NVSIZE} >/dev/null 2>&1
         	if [ ${RC} -ne 0 ]; then
+        		# Zeroize keyfile regardless of success/fail
+        		dd if=/dev/zero of=${KEYFILE} bs=1c count=${NVSIZE} >/dev/null 2>&1
         		message "TPM: Cryptsetup failed, trying next index..."
         		continue
         	fi
+                # Store keyfile contents to kernel keyring
+                KEYCTLID=`cat ${KEYFILE} | keyctl padd user lukstpm @u`
+                keyctl setperm ${KEYCTLID} 0x3f3f0000
+        	# Zeroize keyfile regardless of success/fail
+        	dd if=/dev/zero of=${KEYFILE} bs=1c count=${NVSIZE} >/dev/null 2>&1
+        	# TBD: Extend at least one of the PCRs with /dev/urandom value to prevent PCR data read
+		# pcr-extend ...
         	message "TPM: Success."
         	${UMOUNT} ${TMPFS_MNT}
         

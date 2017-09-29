@@ -25,4 +25,5 @@ fi
 
 copy_exec /usr/sbin/nv_readvalue
 copy_exec /usr/sbin/getcapability
+copy_exec /usr/sbin/pcr-extend
 egrep '(TPM_LUKS_NV|NVPASS)' /etc/tpm-luks.conf > "${DESTDIR}/etc/tpm-luks.conf"

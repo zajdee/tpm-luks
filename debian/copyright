@@ -2,7 +2,7 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: tpm-luks
 Source: https://github.com/zajdee/tpm-luks, https://github.com/shpedoikal/tpm-luks
 
-Files: debian/*, pcrsum/*, tpm-luks-scripts/*
+Files: debian/*, pcrsum/*, tpm-luks-scripts/*, swtpm-utils/pcr-extend
 Copyright: 2016 Radek Zajic <radek@zajic.v.pytli.cz>
 License: GPL-2+
  This package is free software; you can redistribute it and/or modify

@@ -18,3 +18,4 @@ pcrsum/pcrsum								usr/sbin/
 pcrsum/pcrdecode							usr/sbin/
 swtpm-utils/getcapability						usr/sbin/
 swtpm-utils/nv_readvalue						usr/sbin/
+swtpm-utils/pcr-extend							usr/sbin/
