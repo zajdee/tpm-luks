@@ -9,7 +9,7 @@ Homepage: https://github.com/zajdee/tpm-luks
 
 Package: tpm-luks
 Architecture: any-i386 any-amd64
-Depends: ${shlibs:Depends}, ${misc:Depends}, trousers, tpm-tools, binutils, mawk, efibootmgr, grep, coreutils, util-linux, sed, bash, cryptsetup-bin, grub-common
+Depends: ${shlibs:Depends}, ${misc:Depends}, trousers, tpm-tools, binutils, mawk, efibootmgr, grep, coreutils, util-linux, sed, bash, cryptsetup-bin, grub-common, keyutils
 Description: Tools to manage your LUKS keys in TPM
  When your system is properly measured using measured boot, you can
  securely store LUKS keys within the Trusted Platform Module (TPM).

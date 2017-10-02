@@ -23,3 +23,5 @@ swtpm-utils/getcapability
 swtpm-utils/lib/libtpm.la
 swtpm-utils/nv_readvalue
 swtpm-utils/pcr-extend
+pcrsum/pcrdecode
+pcrsum/pcrsum
