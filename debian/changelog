@@ -1,3 +1,9 @@
+tpm-luks (0.02-2zesty) zesty; urgency=medium
+
+  * Updated release with minor bugfixes
+
+ -- Radek Zajic <radek@zajic.v.pytli.cz>  Thu, 05 Oct 2017 00:18:54 +0200
+
 tpm-luks (0.02-1zesty) zesty; urgency=medium
 
   * Initial release with support for TPM 1.2.
