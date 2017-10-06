@@ -39,7 +39,7 @@ if [ -z "$EFIDISK" ]; then
     exit 4
 fi
 echoerr "EFIDISK=$EFIDISK"
-MOUNTPOINT=`mount | grep $EFIDISK | awk '{print $3}'`
+MOUNTPOINT=`mount | grep -w $EFIDISK | awk '{print $3}'`
 if [ -z "$MOUNTPOINT" ]; then
     echoerr "Unable to determine current boot entry UUID disk (is the disk present?)"
     exit 5
